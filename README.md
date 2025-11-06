@@ -1,6 +1,6 @@
 <a name="readme-top"></a>
 
-<div align="center">
+<div  align="center">
   <img src="https://raw.githubusercontent.com/OpenHands/docs/main/openhands/static/img/logo.png" alt="Logo" width="200">
   <h1 align="center">OpenHands Software Agent SDK </h1>
 </div>

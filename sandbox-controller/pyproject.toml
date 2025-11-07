@@ -1,0 +1,21 @@
+[project]
+name = "openhands-sandbox-controller"
+version = "0.1.0"
+description = "Secure sandbox controller for OpenHands sub-sandboxes"
+authors = [{name = "OpenHands"}]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2.8",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+openhands-sandbox-controller = "openhands.sandbox_controller.__main__:main"
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

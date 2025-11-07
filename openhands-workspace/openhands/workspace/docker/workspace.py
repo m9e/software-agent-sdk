@@ -11,6 +11,10 @@ from urllib.request import urlopen
 
 from pydantic import Field, PrivateAttr, model_validator
 
+from openhands.sandbox_controller import SandboxControllerClient
+from openhands.sandbox_controller.client import SandboxHandle
+from openhands.sandbox_controller.schema import MountSpec, PortBinding
+
 from openhands.agent_server.docker.build import (
     BuildOptions,
     PlatformType,
@@ -116,11 +120,29 @@ class DockerWorkspace(RemoteWorkspace):
         default=False,
         description="Whether to expose additional ports (VSCode, VNC).",
     )
+    sandbox_controller_url: str | None = Field(
+        default=None,
+        description=(
+            "Optional URL for the sandbox controller API. When provided, Docker"
+            " containers are created via the controller instead of using the local"
+            " docker CLI."
+        ),
+    )
+    controller_host_alias: str = Field(
+        default="host.docker.internal",
+        description=(
+            "Host name to reach controller-managed sandboxes. Only used when"
+            " sandbox_controller_url is set."
+        ),
+    )
 
     _container_id: str | None = PrivateAttr(default=None)
     _logs_thread: threading.Thread | None = PrivateAttr(default=None)
     _stop_logs: threading.Event = PrivateAttr(default_factory=threading.Event)
     _image: str = PrivateAttr()
+    _sandbox_client: SandboxControllerClient | None = PrivateAttr(default=None)
+    _sandbox_handle: SandboxHandle | None = PrivateAttr(default=None)
+    _controller_mode: bool = PrivateAttr(default=False)
 
     @model_validator(mode="after")
     def _validate_images(self):
@@ -129,10 +151,21 @@ class DockerWorkspace(RemoteWorkspace):
             raise ValueError(
                 "Exactly one of 'base_image' or 'server_image' must be set."
             )
+        if self.sandbox_controller_url and self.base_image is not None:
+            raise ValueError(
+                "sandbox_controller_url mode requires 'server_image' to be set"
+            )
         return self
 
     def model_post_init(self, context: Any) -> None:
         """Set up the Docker container and initialize the remote workspace."""
+        if self.sandbox_controller_url:
+            self._initialize_with_controller(context)
+        else:
+            self._initialize_with_local_docker(context)
+
+    def _initialize_with_local_docker(self, context: Any) -> None:
+        """Bootstrap the workspace by invoking the local docker CLI."""
         # Determine port
         if self.host_port is None:
             self.host_port = find_available_tcp_port()
@@ -161,7 +194,6 @@ class DockerWorkspace(RemoteWorkspace):
             )
 
         # Build image if needed
-
         if self.base_image:
             if "ghcr.io/openhands/agent-server" in self.base_image:
                 raise RuntimeError(
@@ -239,9 +271,9 @@ class DockerWorkspace(RemoteWorkspace):
             )
             self._logs_thread.start()
 
+        self._controller_mode = False
+
         # Set host for RemoteWorkspace to use
-        # The container exposes port 8000, mapped to self.host_port
-        # Override parent's host initialization
         object.__setattr__(self, "host", f"http://localhost:{self.host_port}")
         object.__setattr__(self, "api_key", None)
 
@@ -250,6 +282,83 @@ class DockerWorkspace(RemoteWorkspace):
         logger.info("Docker workspace is ready at %s", self.host)
 
         # Now initialize the parent RemoteWorkspace with the container URL
+        super().model_post_init(context)
+
+    def _initialize_with_controller(self, context: Any) -> None:
+        """Bootstrap the workspace using the sandbox controller service."""
+        if not self.server_image:
+            raise RuntimeError("server_image must be provided when using controller")
+
+        self._image = self.server_image
+        requested_host_port = self.host_port
+        port_bindings: list[PortBinding] = [
+            PortBinding(container=8000, host=requested_host_port),
+        ]
+        if self.extra_ports:
+            vscode_host = None if requested_host_port is None else requested_host_port + 1
+            desktop_host = (
+                None if requested_host_port is None else requested_host_port + 2
+            )
+            port_bindings.extend(
+                [
+                    PortBinding(container=8001, host=vscode_host),
+                    PortBinding(container=8002, host=desktop_host),
+                ]
+            )
+
+        environment = {
+            key: os.environ[key]
+            for key in self.forward_env
+            if key in os.environ
+        }
+
+        mounts: list[MountSpec] = []
+        if self.mount_dir:
+            mounts.append(
+                MountSpec(source=self.mount_dir, target="/workspace", read_only=False)
+            )
+            logger.info(
+                "Requesting mount of host dir %s to container path /workspace", self.mount_dir
+            )
+
+        client = SandboxControllerClient(self.sandbox_controller_url)
+        try:
+            handle = client.create_sandbox(
+                image=self._image,
+                platform=self.platform,
+                ports=port_bindings,
+                environment=environment,
+                mounts=[mount.model_dump() for mount in mounts],
+                command=["--host", "0.0.0.0", "--port", "8000"],
+            )
+        except Exception:
+            client.close()
+            raise
+
+        self._sandbox_client = client
+        self._sandbox_handle = handle
+        self._controller_mode = True
+        self._container_id = handle.container_id
+
+        host_port = handle.ports.get(8000)
+        if host_port is None:
+            raise RuntimeError("Sandbox controller did not return a port for 8000")
+        if requested_host_port is not None and host_port != requested_host_port:
+            logger.warning(
+                "Controller assigned host port %s, overriding requested port %s",
+                host_port,
+                requested_host_port,
+            )
+        self.host_port = host_port
+
+        # Set host for RemoteWorkspace to use (controller may require different hostname)
+        host_alias = self.controller_host_alias or "localhost"
+        object.__setattr__(self, "host", f"http://{host_alias}:{self.host_port}")
+        object.__setattr__(self, "api_key", None)
+
+        self._wait_for_health()
+        logger.info("Controller-managed Docker workspace is ready at %s", self.host)
+
         super().model_post_init(context)
 
     def _stream_docker_logs(self) -> None:
@@ -282,7 +391,7 @@ class DockerWorkspace(RemoteWorkspace):
     def _wait_for_health(self, timeout: float = 120.0) -> None:
         """Wait for the Docker container to become healthy."""
         start = time.time()
-        health_url = f"http://127.0.0.1:{self.host_port}/health"
+        health_url = f"{self.host}/health"
 
         while time.time() - start < timeout:
             try:
@@ -293,7 +402,7 @@ class DockerWorkspace(RemoteWorkspace):
                 pass
 
             # Check if container is still running
-            if self._container_id:
+            if self._container_id and not self._controller_mode:
                 ps = execute_command(
                     [
                         "docker",
@@ -327,6 +436,23 @@ class DockerWorkspace(RemoteWorkspace):
 
     def cleanup(self) -> None:
         """Stop and remove the Docker container."""
+        if self._controller_mode:
+            handle = self._sandbox_handle
+            client = self._sandbox_client
+            self._sandbox_handle = None
+            self._sandbox_client = None
+            if client:
+                try:
+                    if handle:
+                        client.delete_sandbox(handle.sandbox_id)
+                except Exception:
+                    logger.exception("Failed to delete sandbox via controller")
+                finally:
+                    client.close()
+            self._container_id = None
+            self._controller_mode = False
+            return
+
         if self._container_id:
             # Stop logs streaming
             self._stop_logs.set()

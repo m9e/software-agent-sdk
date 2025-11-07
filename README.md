@@ -61,6 +61,33 @@ conversation.run()
 
 For installation instructions and detailed setup, see the [Getting Started Guide](https://docs.openhands.dev/sdk/getting-started).
 
+## Sandbox Controller
+
+OpenHands now ships with a standalone **Sandbox Controller** service that mediates
+Docker access for agent sub-sandboxes. Instead of giving the agent server direct
+access to the Docker socket, start the controller on the host:
+
+```bash
+uv run openhands-sandbox-controller --host 0.0.0.0 --port 8085
+```
+
+The controller exposes a REST API that validates sandbox creation requests and
+enforces image and port policies before launching containers. To use it from the
+Python SDK, configure the `DockerWorkspace` with a pre-built server image and the
+controller endpoint:
+
+```python
+from openhands.workspace import DockerWorkspace
+
+workspace = DockerWorkspace(
+    server_image="ghcr.io/openhands/agent-server:latest",
+    sandbox_controller_url="http://host.docker.internal:8085",
+)
+```
+
+In controller mode the workspace will request sandbox containers through the
+validated API and automatically clean them up when finished.
+
 ## Documentation
 
 For detailed documentation, tutorials, and API reference, visit:

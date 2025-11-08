@@ -13,6 +13,12 @@ dependencies = [
 [project.scripts]
 openhands-sandbox-controller = "openhands.sandbox_controller.__main__:main"
 
+[tool.hatch.build.targets.wheel]
+packages = ["openhands"]
+
+[tool.hatch.build.targets.sdist]
+include = ["openhands", "pyproject.toml", "README.md", "LICENSE"]
+
 [tool.uv]
 package = true
 
